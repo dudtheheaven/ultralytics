@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os  # scy modi
+
 import math
 import random
 from copy import copy
@@ -33,7 +35,7 @@ class DetectionTrainer(BaseTrainer):
         loss_names (tuple): Names of the loss components used in training (box_loss, cls_loss, dfl_loss).
 
     Methods:
-        build_dataset: Build YOLO dataset for training or validation.
+        build_dataset: Build YOLO Dataset for training or validation.
         get_dataloader: Construct and return dataloader for the specified mode.
         preprocess_batch: Preprocess a batch of images by scaling and converting to float.
         set_model_attributes: Set model attributes based on dataset information.
@@ -95,6 +97,39 @@ class DetectionTrainer(BaseTrainer):
         if getattr(dataset, "rect", False) and shuffle and not np.all(dataset.batch_shapes == dataset.batch_shapes[0]):
             LOGGER.warning("'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
             shuffle = False
+
+        # scy modi: env toggle for WeightedRandomSampler (0=off, 1=on)
+        weighted_sampler = None
+        use_weighted_sampler = os.getenv("SCY_USE_WEIGHTED_SAMPLER", "1") == "1"  # scy modi
+        if mode == "train" and use_weighted_sampler:  # scy modi
+            from collections import Counter
+            from torch.utils.data import WeightedRandomSampler
+            cls_counts: Counter = Counter()
+            for label in dataset.labels:
+                for c in label["cls"].flatten().tolist():
+                    cls_counts[int(c)] += 1
+            if cls_counts:
+                num_classes = max(cls_counts.keys()) + 1
+                class_weights = torch.zeros(num_classes)
+                for cls_id, cnt in cls_counts.items():
+                    class_weights[cls_id] = 1.0 / max(cnt, 1)  # scy modi: inverse frequency
+                sample_weights = []
+                for label in dataset.labels:
+                    cls_list = label["cls"].flatten().tolist()
+                    if cls_list:
+                        w = float(class_weights[[int(c) for c in cls_list]].max())
+                    else:
+                        w = float(class_weights.mean()) if len(class_weights) else 1.0
+                    sample_weights.append(w)
+                weighted_sampler = WeightedRandomSampler(
+                    weights=torch.tensor(sample_weights, dtype=torch.float),
+                    num_samples=len(sample_weights),
+                    replacement=True,
+                )
+                LOGGER.info(f"scy modi: WeightedRandomSampler enabled. class counts: {dict(sorted(cls_counts.items()))}")
+        elif mode == "train":  # scy modi
+            LOGGER.info("scy modi: WeightedRandomSampler disabled (SCY_USE_WEIGHTED_SAMPLER=0)")
+
         return build_dataloader(
             dataset,
             batch=batch_size,
@@ -102,6 +137,7 @@ class DetectionTrainer(BaseTrainer):
             shuffle=shuffle,
             rank=rank,
             drop_last=self.args.compile and mode == "train",
+            weighted_sampler=weighted_sampler,  # scy modi
         )
 
     def preprocess_batch(self, batch: dict) -> dict:

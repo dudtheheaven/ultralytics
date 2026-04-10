@@ -53,7 +53,7 @@ class InfiniteDataLoader(dataloader.DataLoader):
     Examples:
         Create an infinite DataLoader for training
         >>> dataset = YOLODataset(...)
-        >>> dataloader = InfiniteDataLoader(dataset, batch_size=16, shuffle=True)
+        >>> dataloader = InfiniteDataLoader(dataset, batch_size=16)
         >>> for batch in dataloader:  # Infinite iteration
         >>>     train_step(batch)
     """
@@ -214,6 +214,56 @@ class ContiguousDistributedSampler(torch.utils.data.Sampler):
         self.epoch = epoch
 
 
+class DistributedWeightedSampler(torch.utils.data.Sampler):
+    """scy modi: DDP-compatible weighted sampler."""
+
+    def __init__(
+        self,
+        weights: torch.Tensor,
+        num_samples: int,
+        num_replicas: int | None = None,
+        rank: int | None = None,
+        replacement: bool = True,
+        seed: int = 0,
+    ) -> None:
+        if num_replicas is None:
+            num_replicas = dist.get_world_size() if dist.is_initialized() else 1
+        if rank is None:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        self.replacement = replacement
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0
+
+        # scy modi: make total size divisible by world size
+        self.num_samples = int(math.ceil(num_samples / self.num_replicas))
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+
+        # scy modi: draw globally, then shard by rank
+        indices = torch.multinomial(
+            self.weights,
+            self.total_size,
+            self.replacement,
+            generator=g,
+        ).tolist()
+
+        indices = indices[self.rank : self.total_size : self.num_replicas]
+        return iter(indices)
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+
 def seed_worker(worker_id: int) -> None:
     """Set dataloader worker seed for reproducibility across worker processes."""
     worker_seed = torch.initial_seed() % 2**32
@@ -291,6 +341,7 @@ def build_dataloader(
     rank: int = -1,
     drop_last: bool = False,
     pin_memory: bool = True,
+    weighted_sampler: torch.utils.data.Sampler = None,  # scy modi
 ) -> InfiniteDataLoader:
     """Create and return an InfiniteDataLoader for training or validation.
 
@@ -314,13 +365,31 @@ def build_dataloader(
     batch = min(batch, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min(os.cpu_count() // max(nd, 1), workers)  # number of workers
-    sampler = (
-        None
-        if rank == -1
-        else distributed.DistributedSampler(dataset, shuffle=shuffle)
-        if shuffle
-        else ContiguousDistributedSampler(dataset)
-    )
+
+    # scy modi: WeightedRandomSampler 우선, DDP면 DistributedWeightedSampler로 변환
+    if weighted_sampler is not None:
+        shuffle = False  # scy modi: sampler 사용 시 shuffle 비활성화
+
+        if rank == -1:
+            sampler = weighted_sampler
+        else:
+            sampler = DistributedWeightedSampler(
+                weights=weighted_sampler.weights,
+                num_samples=weighted_sampler.num_samples,
+                replacement=getattr(weighted_sampler, "replacement", True),
+                num_replicas=dist.get_world_size() if dist.is_initialized() else 1,
+                rank=rank,
+                seed=6148914691236517205,  # scy modi
+            )
+    else:
+        sampler = (
+            None
+            if rank == -1
+            else distributed.DistributedSampler(dataset, shuffle=shuffle)
+            if shuffle
+            else ContiguousDistributedSampler(dataset)
+        )
+
     generator = torch.Generator()
     generator.manual_seed(6148914691236517205 + RANK)
     return InfiniteDataLoader(
